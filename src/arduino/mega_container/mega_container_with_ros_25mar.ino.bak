@@ -1,0 +1,911 @@
+/*------------------------------- INFO -------------------------------*/
+//Arduino Mega Port Container
+/*--------------------------------------------------------------------*/
+
+
+// Libraries
+#include <Wire.h>
+#include <Adafruit_MCP4725.h>
+#include <SoftPWM.h>
+Adafruit_MCP4725 dac1, dac2;
+#define PI 3.14159
+
+
+/*------------------------------- Locker -------------------------------*/
+bool locker_setpoint = 1;
+/*--------------------------------------------------------------------*/
+
+/*------------------------------- Pendant ------------------------------*/
+bool pendantControl = true;
+unsigned long timer_pendant = 0;  // debouncer purpose
+/*--------------------------------------------------------------------*/
+
+/*-------------------------------- Steer -------------------------------*/
+// #define STEER_FRONT_MIN_RAD -0.437324498 //(-25.05684802deg) // turn right end angle
+#define STEER_FRONT_MIN_RAD -0.5 // turn right end angle
+#define STEER_FRONT_MIN_BIT 1010
+// #define STEER_FRONT_MAX_RAD 0.452846532 //(25,94619505deg) //turn left end angle
+#define STEER_FRONT_MAX_RAD 0.5//turn left end angle
+#define STEER_FRONT_MAX_BIT 844
+
+unsigned int steer_front_actual_bit = 0;
+unsigned int steer_front_setpoint_bit = 0;
+float steer_front_actual_rad = 0;
+float steer_front_setpoint_rad = 0;
+
+unsigned int steer_rear_actual_bit = 0;
+unsigned int steer_rear_setpoint_bit = 0;
+float steer_rear_actual_rad = 0;
+float steer_rear_setpoint_rad = 0;
+/*--------------------------------------------------------------------*/
+
+/*-------------------------------- Throttle ----------------------------*/
+#define THROTTLE_MAX 100 // percentage 0~100
+#define THROTTLE_MIN 0 // percentage 0~100
+#define THROTTLE_DAC_THRESHOLD 900 // bit DAC
+float throttle_setpoint = 0; // 0~100
+byte throttle_mode = 0; // All/Front/Rear Wheel-Drive
+int count_throttle_do = 0;
+
+bool speed_control_mode = 0;
+float speed_setpoint = 0;
+/*--------------------------------------------------------------------*/
+
+/*---------------------------------- Brake -----------------------------*/
+#define BRAKE_MAX 100
+#define BRAKE_MIN 0
+float handbrake_setpoint_now = 0; // 0~100
+float handbrake_setpoint_bef = 0;
+int handbrake_count = 0;
+float brake_current = 0;
+
+float brake_regen_setpoint = 0;
+/*--------------------------------------------------------------------*/
+
+/*-------------------------------- ROS ---------------------------------*/
+#include <ros.h>
+#include <agv_container/Mega_Container.h>
+// #include <geometry_msgs/TwistStamped.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#define BAUD 500000
+
+#define DEBUG_BUFFER_LENGTH 120
+char debug_buffer[DEBUG_BUFFER_LENGTH];
+String debug_buffer_string = "";
+int ros_period = 20; // Milisekon, 50 Hz
+unsigned long ros_time = 0; // Milisecond
+
+ros::NodeHandle  nh;
+// agv_container::Mega_Container pub_msg;
+geometry_msgs::PoseWithCovarianceStamped pub_msg;
+ros::Publisher pub("logging_arduino", &pub_msg);
+
+void receive_message(const geometry_msgs::PoseWithCovarianceStamped& sub_msg) {
+  if (!pendantControl) {
+    steer_front_setpoint_rad = min(max(sub_msg.pose.covariance[0], STEER_FRONT_MIN_RAD), STEER_FRONT_MAX_RAD);
+    throttle_setpoint = min(max(sub_msg.pose.covariance[1], THROTTLE_MIN), THROTTLE_MAX);
+    handbrake_setpoint_now = min(max(sub_msg.pose.covariance[2], BRAKE_MIN), BRAKE_MAX);
+    locker_setpoint = sub_msg.pose.covariance[3];
+    speed_control_mode = int(sub_msg.pose.covariance[8]);
+    speed_setpoint = sub_msg.pose.covariance[9];
+    brake_regen_setpoint = float(sub_msg.pose.covariance[11]);
+  }
+}
+
+ros::Subscriber<geometry_msgs::PoseWithCovarianceStamped> sub("control_signal", &receive_message );
+/*--------------------------------------------------------------------*/
+
+
+// PIN and Variable Declaration
+// DAC
+#define DAC_RESOLUTION (8) //8 bit DAC
+#define EN_SUP_DPN 9 //12V enabler
+#define FWR_MODE 26 //Front Wheel Right Mode
+#define FWR_BRAKE 27 //Front Wheel Right Regen Brake
+#define FWL_MODE 28 //Front Wheel Left Mode
+#define FWL_BRAKE 29 //Front Wheel Left Regen Brake
+#define EN_SUP_BLKG 8 //12V enabler
+#define RWR_MODE 22 //Front Wheel Right Mode
+#define RWR_BRAKE 23 //Front Wheel Right Regen Brake
+#define RWL_MODE 24 //Front Wheel Left Mode
+#define RWL_BRAKE 25 //Front Wheel Left Regen Brake
+#define PENDANT_THROTTLE_PIN 2
+#define INPUT_PENDANT_MODE_PIN 16
+#define PENDANT_BRAKE_REGEN_PIN 3
+
+
+// Absolute Encoder
+#define BITS 10 //10 bit data
+#define LSB1 41 //Front
+#define LSB2 51 //Rear
+int arr[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
+// int front_angle, rear_angle;
+// float steer_front_actual = 0;
+// Hand Brake
+#define HB_SWITCH 15
+#define EN 4
+#define PWM_R 5
+#define PWM_L 6
+bool HB_bef = true;
+bool HB_now = true;
+// maju/mundur?
+#define DIR_SWITCH 17
+bool reverse_bef = false;
+bool reverse_now = false;
+// Lock Container?
+#define LC_SWITCH 14
+#define LC_SIG A6 //A14
+// Steer Signal
+#define ST0_SIG A10
+#define ST1_SIG A8
+// Steer State dip Switch
+#define DS_SS0_SIG A14 //A6
+#define DS_SS0 A15
+#define DS_SS1_SIG A12 //A4
+#define DS_SS1 A13
+bool FWS = true;
+bool RWS = false;
+bool AWS = false;
+// Prop State dip Switch
+#define DS_PROP1 A11
+#define DS_PROP2 A9
+bool FWD = false;
+bool RWD = true;
+bool AWD = false;
+volatile int count_speed = 0;
+
+
+bool isPendantMode() {
+  if (!digitalRead(INPUT_PENDANT_MODE_PIN)) {
+    if (millis() - timer_pendant > 200) {return true;}
+    else {return false;}
+  }
+  else {
+    timer_pendant = millis();
+    return false;
+  }
+}
+
+void steer()
+{
+  if (!digitalRead(A7))
+  {
+    digitalWrite(ST0_SIG, LOW);
+    //    //Serial.println("Belok Kanan");
+  }
+  else if (!digitalRead(A5))
+  {
+    digitalWrite(ST1_SIG, LOW);
+    //    //Serial.println("Belok Kiri");
+  }
+  else
+  {
+    digitalWrite(ST0_SIG, HIGH);
+    digitalWrite(ST1_SIG, HIGH);
+    //    //Serial.println("No Turn");
+  }
+}
+
+void steer_vD1() {
+  // Read steer angle setpoint
+  if (pendantControl == true) { // If using pendant
+    if (!digitalRead(A7)) {
+      steer_front_setpoint_rad = STEER_FRONT_MIN_RAD; // Move to max right
+    }
+    else if (!digitalRead(A5)) {
+      steer_front_setpoint_rad = STEER_FRONT_MAX_RAD; // Move to max left
+    }
+    else {
+      steer_front_setpoint_rad = steer_front_actual_rad; // Stop at current angle
+      // steer_front_setpoint = 0; // (Optional) Move to normal angle
+    }
+  }
+
+  // Read actual steer angle
+  steer_front_actual_bit = baca_encoder(LSB1);
+  steer_front_actual_rad = (steerBit2Rad(steer_front_actual_bit));
+  // rear_angle = baca_encoder(LSB2);
+
+//  debug_buffer_string = String(pendantControl) + " " + String(steer_front_actual_bit) + " " + String(steer_front_actual_rad) + " " + String(steer_front_setpoint_rad);
+
+  // Apply value to command arduino_nano_steer
+  if (steer_front_setpoint_rad < steer_front_actual_rad) {
+    digitalWrite(ST0_SIG, LOW); // Move to right
+    digitalWrite(ST1_SIG, HIGH);
+//    debug_buffer_string += " toRight";
+  }
+  else if (steer_front_setpoint_rad > steer_front_actual_rad) {
+    digitalWrite(ST0_SIG, HIGH);
+    digitalWrite(ST1_SIG, LOW); // Move to left
+//    debug_buffer_string += " toLeft";
+  }
+  else {
+    digitalWrite(ST0_SIG, HIGH); // Stop/do nothing
+    digitalWrite(ST1_SIG, HIGH);
+//    debug_buffer_string += " stopped";
+  }
+  
+//  debug_buffer_string.toCharArray(debug_buffer, 100);
+//  nh.loginfo(debug_buffer);
+}
+
+byte steer_routine_mode = 0;
+
+void steer_vD2() {
+  // Read steer angle setpoint
+  if (pendantControl == true) { // If using pendant
+    if (!digitalRead(A7)) {
+      steer_front_setpoint_rad = STEER_FRONT_MIN_RAD; // Move to max right
+    }
+    else if (!digitalRead(A5)) {
+      steer_front_setpoint_rad = STEER_FRONT_MAX_RAD; // Move to max left
+    }
+    else {
+      steer_front_setpoint_rad = steer_front_actual_rad; // Stop at current angle
+      // steer_front_setpoint = 0; // (Optional) Move to normal angle
+    }
+  }
+
+  steer_front_setpoint_bit = steerRad2Bit(steer_front_setpoint_rad);
+
+  // Read actual steer angle
+  steer_front_actual_bit = baca_encoder(LSB1);
+  steer_front_actual_rad = (steerBit2Rad(steer_front_actual_bit));
+  steer_rear_actual_bit = baca_encoder(LSB2);
+  steer_rear_actual_rad = (steerBit2Rad(steer_rear_actual_bit));
+
+//  debug_buffer_string = String(pendantControl) + " " + String(steer_front_actual_rad) + " " + String(steer_front_actual_bit) + " " + String(steer_front_setpoint_rad) + " " + String(steer_front_setpoint_bit);
+
+  // Apply value to command arduino_nano_steer
+  if (abs(steer_front_setpoint_bit-steer_front_actual_bit) > 5) { // threshold
+    if (steer_front_setpoint_rad < steer_front_actual_rad) {
+      digitalWrite(ST0_SIG, LOW); // Move to right
+      digitalWrite(ST1_SIG, HIGH);
+      steer_routine_mode = 0;
+//      debug_buffer_string += " toRight";
+    }
+    else if (steer_front_setpoint_rad > steer_front_actual_rad) {
+      digitalWrite(ST0_SIG, HIGH);
+      digitalWrite(ST1_SIG, LOW); // Move to left
+      steer_routine_mode = 1;
+//      debug_buffer_string += " toLeft";
+    }
+  }
+  else {
+    digitalWrite(ST0_SIG, HIGH); // Stop/do nothing
+    digitalWrite(ST1_SIG, HIGH);
+    steer_routine_mode = 2;
+//    debug_buffer_string += " stopped";
+  }
+  
+//  debug_buffer_string.toCharArray(debug_buffer, 100);
+//  nh.loginfo(debug_buffer);
+}
+
+float steerBit2Rad(int bit_val) {
+  //y = 0.3211x-296.71; bit2degree
+  return (((0.3211 * float(bit_val)) - 296.71) * -1 * PI / 180);
+}
+
+unsigned int steerRad2Bit(float rad_val) {
+  // x = (y+296.71)/0.3211 degree2bit
+  return int( (rad2deg(rad_val * -1)+296.71)/0.3211 );
+}
+
+float rad2deg(float rad_val) {
+  return (rad_val*180/PI);
+}
+
+float wrap_angle(float val) {
+  if (val > PI) {
+    while (val > PI) {val = val - PI;}
+  }
+  else if (val < (-1*PI)) {
+    while (val < (-1*PI)) {val = val + PI;}
+  }
+  return val;
+}
+
+int throttlePercentageToDAC(float throttle_val) {
+  // From percentage (0~100) to DAC input (700~1000)
+  if (throttle_val > 0) {
+    // y = (y2-y1)*(x-x1)/(x2-x1) + y1
+    throttle_val = (2000-700)*(throttle_val-0)/(100-0) + 700;
+  }
+
+  // Apply value to DAC input
+  if (pendantControl) {
+    if (throttle_val == 0) {
+      return 0;
+    }
+    else {
+      if (count_throttle_do < 10) {
+        return max(throttle_val, THROTTLE_DAC_THRESHOLD);
+      }
+      else {
+        return throttle_val;
+      }
+    }
+  }
+  else {
+    return throttle_val;
+  }
+
+}
+
+void propulsion()
+{
+  //  int count_speed;
+  if (!digitalRead(2))
+  {
+    if (FWD)
+    {
+      if (count_speed < 10) //tarikan awal
+      {
+        dac1.setVoltage(850, false);
+        count_speed = count_speed + 1;
+      }
+      else if (count_speed >= 10)
+      {
+        dac1.setVoltage(680, false); //steady
+        count_speed = count_speed + 1;
+      }
+      //      //Serial.println("majuuu FWD");
+    }
+    else if (RWD)
+    {
+      if (count_speed < 10) //tarikan awal
+      {
+        dac2.setVoltage(850, false);
+        count_speed = count_speed + 1;
+      }
+      else if (count_speed >= 10)
+      {
+        dac2.setVoltage(680, false); //steady
+        count_speed = count_speed + 1;
+      }
+      //      //Serial.println("majuuu RWD");
+    }
+    else if (AWD)
+    {
+      if (count_speed < 10) //tarikan awal
+      {
+        dac1.setVoltage(850, false);
+        dac2.setVoltage(850, false);
+        count_speed = count_speed + 1;
+      }
+      else if (count_speed >= 10)
+      {
+        dac1.setVoltage(680, false);
+        dac2.setVoltage(680, false); //steady
+        count_speed = count_speed + 1;
+      }
+      //      dac1.setVoltage(850, false);
+      //      dac2.setVoltage(850, false);
+      //      //Serial.println("majuuu AWD");
+    }
+  }
+  else
+  {
+    count_speed = 0; //reset
+    dac1.setVoltage(0, false);
+    dac2.setVoltage(0, false);
+  }
+}
+
+void propulsion_vD1() {
+  // Read Throttle Setpoint
+  if (pendantControl) { // If using pendant
+    if (!digitalRead(PENDANT_THROTTLE_PIN)) {
+      throttle_setpoint = 100; // in percentage
+    }
+    else {
+      throttle_setpoint = 0; // in percentage
+    }
+  }
+
+  // Output DAC
+  if (throttle_setpoint == 0) {
+    count_throttle_do = 0; // Reset index
+    dac1.setVoltage(0, false);
+    dac2.setVoltage(0, false);
+    //activate regen brake
+    // digitalWrite(RWL_BRAKE, HIGH);
+    // digitalWrite(RWR_BRAKE, HIGH);
+  }
+  else {
+    // release regen brake
+    // digitalWrite(RWL_BRAKE, LOW);
+    // digitalWrite(RWR_BRAKE, LOW);
+    switch (throttle_mode) {
+      case 0: {   // Front Wheel Drive
+        dac1.setVoltage(throttlePercentageToDAC(throttle_setpoint), false);
+        break;
+      }
+      case 1: {   // Rear Wheel Drive
+        dac2.setVoltage(throttlePercentageToDAC(throttle_setpoint), false);
+        break;
+      }
+      case 2: {   // All Wheel Drive
+        dac1.setVoltage(throttlePercentageToDAC(throttle_setpoint), false);
+        dac2.setVoltage(throttlePercentageToDAC(throttle_setpoint), false);
+        break;
+      }
+    }
+    count_throttle_do++;
+  }
+
+//  debug_buffer_string = String("throttle_setpoint: " + String(throttle_setpoint) + " DAClevel: "+ String(throttlePercentageToDAC(throttle_setpoint)) + " throttle_mode: " + String(throttle_mode));
+  // debug_buffer_string.toCharArray(debug_buffer, 100);
+  // nh.loginfo(debug_buffer);
+}
+
+void regen_brake() {
+  if (!digitalRead(3))
+  {
+    //    digitalWrite(29, HIGH);
+    digitalWrite(RWL_BRAKE, HIGH);
+    digitalWrite(RWR_BRAKE, HIGH);
+    //    digitalWrite(FWL_BRAKE, HIGH);
+    //    digitalWrite(FWR_BRAKE, HIGH);
+    //Serial.println("remmm");
+  }
+  else
+  {
+    digitalWrite(RWL_BRAKE, LOW);
+    digitalWrite(RWR_BRAKE, LOW);
+    //    digitalWrite(FWL_BRAKE, LOW);
+    //    digitalWrite(FWR_BRAKE, LOW);
+  }
+}
+
+
+void regen_brake_vD1() {
+  // Read brake_regen Setpoint
+  if (pendantControl) { // If using pendant
+    if (!digitalRead(PENDANT_BRAKE_REGEN_PIN)) {
+      brake_regen_setpoint = 100; // in percentage
+    }
+    else {
+      brake_regen_setpoint = 0; // in percentage
+    }
+  }
+
+
+  if (brake_regen_setpoint == 100) {
+    //    digitalWrite(29, HIGH);
+    digitalWrite(RWL_BRAKE, HIGH);
+    digitalWrite(RWR_BRAKE, HIGH);
+    //    digitalWrite(FWL_BRAKE, HIGH);
+    //    digitalWrite(FWR_BRAKE, HIGH);
+    //Serial.println("remmm");
+  }
+  else {
+    digitalWrite(RWL_BRAKE, LOW);
+    digitalWrite(RWR_BRAKE, LOW);
+    //    digitalWrite(FWL_BRAKE, LOW);
+    //    digitalWrite(FWR_BRAKE, LOW);
+  }
+}
+
+int binarytodecimal(int *a, int count) {
+  int sum = 0, i;
+  for (i = 0; i < BITS; i++)
+    sum = sum + (arr[i] * a[i]);
+  return sum;
+}
+
+int baca_encoder(int val) {
+  int rawValues[BITS];
+  int i, j;
+  int result;
+
+  j = BITS - 1;
+
+  for (i = val; i > val - BITS; i--) {
+    int readVal;
+    readVal = !digitalRead(i);
+    rawValues[j] = readVal;
+    j--;
+  }
+  result = binarytodecimal(rawValues, BITS);
+  return result;
+}
+
+void MSRB(String condition) //setting mode selector and regenerative brake
+{
+  if (condition == "normal") {
+    //set mode selector and regenerative brake to normal mode
+    //Serial.println("entering normal mode");
+    digitalWrite(RWR_MODE, HIGH);
+    digitalWrite(RWR_BRAKE, LOW);
+    digitalWrite(RWL_MODE, HIGH);
+    digitalWrite(RWL_BRAKE, LOW);
+  }
+  else if (condition == "reverse") {
+    //set mode selector and regenerative brake to reverse mode
+    //Serial.println("reverse the wheel direction");
+    digitalWrite(RWR_MODE, LOW);
+    digitalWrite(RWR_BRAKE, HIGH);
+    digitalWrite(RWL_MODE, LOW);
+    digitalWrite(RWL_BRAKE, HIGH);
+    delay(5000); //wait for approximately 3 seconds, then back to normal
+    //    //Serial.println("Ready!");
+    MSRB("normal");
+  }
+  else if (condition == "init") {
+    //needed at first run, because initially, left wheel set to reverse
+    //Serial.println("wheel direction initialization");
+    //    digitalWrite(RWR_MODE, LOW);
+    //    digitalWrite(RWR_BRAKE, HIGH);
+    digitalWrite(RWL_MODE, LOW);
+    digitalWrite(RWL_BRAKE, HIGH);
+    //    digitalWrite(FWR_MODE, LOW);
+    //    digitalWrite(FWR_BRAKE, HIGH);
+    //    digitalWrite(FWL_MODE, LOW);
+    //    digitalWrite(FWL_BRAKE, HIGH);
+    delay(5000); //keep it for approximately 3 seconds, then back to normal
+    //Serial.println("Ready!");
+    MSRB("normal");
+  }
+}
+
+void reverse()
+{
+  // Check tombol
+  if (!digitalRead(DIR_SWITCH))
+  {
+    reverse_now = true;
+  }
+  else {
+    reverse_now = false;
+  }
+  // Check kondisi sekali
+  if (reverse_now != reverse_bef)
+  {
+    MSRB("reverse");
+    reverse_bef = reverse_now;
+  }
+  else {
+//    //Serial.print("reverse_now:");
+//    //Serial.print("\t");
+//    //Serial.println(reverse_now);
+  }
+}
+
+void reverse_vD1() {
+  // Read throttle direction
+  if (pendantControl) { // If using pendant input
+    if (!digitalRead(DIR_SWITCH)) {
+      reverse_now = true;
+    }
+    else {
+      reverse_now = false;
+    }
+  }
+
+  // Check kondisi sekali
+  if (reverse_now != reverse_bef) {
+    MSRB("reverse");
+    reverse_bef = reverse_now;
+  }
+}
+
+void hand_brake() {
+  // cek tombol
+  if (!digitalRead(HB_SWITCH))
+  {
+    HB_now = true;
+  }
+  else {
+    HB_now = false;
+  }
+  // action, cek sekali saja
+  if (HB_now != HB_bef)
+  {
+    if (HB_now)
+    {
+      //Serial.println("engage braking");
+      digitalWrite(EN, HIGH); //enabling
+      SoftPWMSet(PWM_L, 255);
+      SoftPWMSet(PWM_R, 0);
+      delay(3000); // butuh 3 detik untuk mengerem
+      HB_bef = HB_now;
+    }
+    else if (!HB_now)
+    {
+      //Serial.println("release braking");
+      digitalWrite(EN, HIGH); //enabling
+      SoftPWMSet(PWM_L, 0);
+      SoftPWMSet(PWM_R, 255);
+      delay(3000); // butuh 3 detik untuk mengerem
+      HB_bef = HB_now;
+    }
+  }
+  else
+  {
+    digitalWrite(EN, LOW);
+    SoftPWMSet(PWM_R, 0);
+    SoftPWMSet(PWM_L, 0);
+  }
+//  //Serial.print("brake_state:");
+//  //Serial.print("\t");
+//  //Serial.println(HB_now);
+}
+
+void hand_brake_vD1() {
+  // Read Break Setpoint
+  if (pendantControl) { // If using pendant input
+    if (!digitalRead(HB_SWITCH)) {
+      // HB_now = true;
+      handbrake_setpoint_now = 100;
+    }
+    else {
+      // HB_now = false;
+      handbrake_setpoint_now = 0;
+    }
+  }
+
+  // Apply
+  if (handbrake_count == 0) {
+    if (handbrake_setpoint_now != handbrake_setpoint_bef) {
+      digitalWrite(EN, HIGH); //enabling
+      if (handbrake_setpoint_now > 50) {
+        SoftPWMSet(PWM_L, 255);
+        SoftPWMSet(PWM_R, 0);
+      }
+      else {
+        SoftPWMSet(PWM_L, 0);
+        SoftPWMSet(PWM_R, 255);
+      }
+      handbrake_setpoint_bef = handbrake_setpoint_now;
+      handbrake_count = 1000; // milisecond
+    }
+    else {
+      digitalWrite(EN, LOW);
+      SoftPWMSet(PWM_R, 0);
+      SoftPWMSet(PWM_L, 0);
+    }
+  }
+  else {
+    handbrake_count--;
+    if (handbrake_count < 0) {handbrake_count = 0;}
+  }
+
+  sense_brake_current();
+}
+
+void locker() {
+  // Read Locker Setpoint
+  if (pendantControl) { // If using pendant input
+    if (!digitalRead(LC_SWITCH)) {
+      locker_setpoint = 1;
+    }
+    else {
+      locker_setpoint = 0;
+    }
+  }
+
+  // Action
+  if (locker_setpoint == 1) {
+    digitalWrite(LC_SIG, LOW);
+  }
+  else {
+    digitalWrite(LC_SIG, HIGH);
+  }
+}
+
+void steer_state() {
+  // check dip switch
+  if (!digitalRead(DS_SS0))
+  {
+    FWS = true;
+    RWS = false;
+    AWS = false;
+  }
+  else if (!digitalRead(DS_SS1))
+  {
+    FWS = false;
+    RWS = true;
+    AWS = false;
+  }
+  else
+  {
+    FWS = false;
+    RWS = false;
+    AWS = true;
+  }
+  // kondisi
+  if (FWS)
+  {
+    digitalWrite(DS_SS0_SIG, LOW);
+    digitalWrite(DS_SS1_SIG, HIGH);
+    //    //Serial.print("Steer State:");
+    //    //Serial.print("\t");
+    //    //Serial.println("FWS");
+  }
+  else if (RWS)
+  {
+    digitalWrite(DS_SS0_SIG, HIGH);
+    digitalWrite(DS_SS1_SIG, LOW);
+    //    //Serial.print("Steer State:");
+    //    //Serial.print("\t");
+    //    //Serial.println("RWS");
+  }
+  else if (AWS)
+  {
+    digitalWrite(DS_SS0_SIG, HIGH);
+    digitalWrite(DS_SS1_SIG, HIGH);
+    //    //Serial.print("Steer State:");
+    //    //Serial.print("\t");
+    //    //Serial.println("AWS");
+  }
+}
+
+void prop_state() {
+  // cek dip switch
+  // check dip switch
+  if (!digitalRead(DS_PROP1)) {
+    throttle_mode = 1;  //RWD
+  } else if (!digitalRead(DS_PROP2)) {
+    throttle_mode = 0;  //FWD
+  } else {
+    throttle_mode = 2;  //AWD
+  }
+}
+
+void sense_brake_current() {
+  unsigned int x = 0;
+  float AcsValue = 0.0, AcsValueF = 0.0;
+  AcsValue = analogRead(A0);
+  AcsValueF = (2.5 - (AcsValue * (5.0 / 1024.0)) ) / 0.185;
+  brake_current = AcsValueF;
+}
+
+
+/*------------------------------ MAIN SETUP -------------------------------*/
+void setup() {
+  //Serial.begin(9600);
+  //Serial.println("SETUP!");
+
+  // ROS Setup
+  nh.getHardware()-> setBaud(BAUD);
+  nh.initNode();
+  nh.advertise(pub);
+  nh.subscribe(sub);
+
+  // Mode Pendant
+  pinMode(INPUT_PENDANT_MODE_PIN, INPUT);
+  pendantControl = isPendantMode();
+
+  // Motor Depan
+  for (int i = 30; i > 21; i--) {
+    pinMode(i, OUTPUT);
+  }
+  pinMode(13, OUTPUT);
+  digitalWrite(13, HIGH);
+
+  // Encoder Depan
+  for (int i = LSB1; i > LSB1 - BITS; i--) {
+    pinMode(i, INPUT_PULLUP);
+  }
+
+  // Encoder Belakang
+  for (int i = LSB2; i > LSB2 - BITS; i--) {
+    pinMode(i, INPUT_PULLUP);
+  }
+
+  // Locker Set
+  pinMode(LC_SWITCH, INPUT_PULLUP);
+  pinMode(LC_SIG, OUTPUT);
+  locker();
+
+  // Set Brake Pin
+  SoftPWMBegin();
+  pinMode(HB_SWITCH, INPUT_PULLUP);
+  pinMode(EN, OUTPUT);
+  pinMode(PWM_R, OUTPUT);
+  pinMode(PWM_L, OUTPUT);
+
+  // Cek brake awal
+  hand_brake_vD1();
+
+  // Set DAC Voltage to zero
+  dac2.begin(0x60);
+  dac1.begin(0x61);
+  dac1.setVoltage(0, false);
+  dac2.setVoltage(0, false);
+
+  // Enabling Supply to Motor Driver (must be done after get 0 on DAC)
+  pinMode(EN_SUP_DPN, OUTPUT);
+  pinMode(EN_SUP_BLKG, OUTPUT);
+  digitalWrite(EN_SUP_DPN, HIGH);
+  digitalWrite(EN_SUP_BLKG, HIGH);
+  MSRB("normal");
+  //wait for motor driver to ready getting command
+  delay(5000);
+  MSRB("init");
+
+  //Control manual prop
+  pinMode(2, INPUT_PULLUP);
+
+  //Regen Brake 
+   pinMode(3, INPUT_PULLUP);
+//  pinMode(PENDANT_BRAKE_REGEN_PIN, INPUT_PULLUP);
+
+  // Dip Switch Prop
+  pinMode(DS_PROP1, INPUT_PULLUP);
+  pinMode(DS_PROP2, INPUT_PULLUP);
+  prop_state();
+
+  // Dip Switch Steer
+  pinMode(DS_SS0, INPUT_PULLUP);
+  pinMode(DS_SS1, INPUT_PULLUP);
+  pinMode(DS_SS0_SIG, OUTPUT);
+  pinMode(DS_SS1_SIG, OUTPUT);
+  steer_state();
+
+  //Control manual steer
+  pinMode(A5, INPUT_PULLUP);
+  pinMode(A7, INPUT_PULLUP);
+  pinMode(ST0_SIG, OUTPUT);
+  pinMode(ST1_SIG, OUTPUT);
+  steer_vD2();
+
+  // Check Forward/Reverse
+  pinMode(DIR_SWITCH, INPUT_PULLUP);
+  reverse_vD1();
+  //Serial.print("ready\n");
+  digitalWrite(13, LOW);
+}
+/*--------------------------------------------------------------------*/
+
+
+/*----------------------------- MAIN LOOP ----------------------------*/
+void loop() {
+  pendantControl = isPendantMode();
+  propulsion_vD1();
+  steer_vD2();
+  
+//  debug_buffer_string = "p_mode: " + String(!digitalRead(INPUT_PENDANT_MODE_PIN)) + String(pendantControl) + " sf_a_rad: " + String(steer_front_actual_rad) + "  sf_a_bit: " + String(steer_front_actual_bit) + "  sf_sp_rad: " + String(steer_front_setpoint_rad) + "  sf_sp_bit: " + String(steer_front_setpoint_bit);
+////  debug_buffer_string += " handbrake_button: " + String(digitalRead(HB_SWITCH)) + " handbrake_setpoint: " + String(handbrake_setpoint_now);
+//   debug_buffer_string += String(" t_sp: " + String(throttle_setpoint) + " t_DAC: "+ String(throttlePercentageToDAC(throttle_setpoint)) + " t_mode: " + String(throttle_mode));
+//  debug_buffer_string.toCharArray(debug_buffer, DEBUG_BUFFER_LENGTH);
+//  nh.loginfo(debug_buffer);
+
+  steer_state();
+  // regen_brake();
+  regen_brake_vD1();
+  reverse_vD1();
+  hand_brake_vD1();
+  locker();
+  prop_state();
+
+  // Publish the pub_msg
+  if ((millis() - ros_time) >= ros_period) {
+    ros_time = millis();
+    pub_msg.header.stamp = nh.now();
+    // pub_msg.front_encoder_DEC = steer_front_actual_bit;
+    pub_msg.pose.covariance[0] = pendantControl;
+    pub_msg.pose.covariance[1] = speed_control_mode;
+    pub_msg.pose.covariance[2] = speed_setpoint;
+    pub_msg.pose.covariance[3] = throttle_mode;
+    pub_msg.pose.covariance[4] = throttle_setpoint;
+    pub_msg.pose.covariance[5] = throttlePercentageToDAC(throttle_setpoint);
+    pub_msg.pose.covariance[6] = steer_front_actual_bit;
+    pub_msg.pose.covariance[7] = steer_front_actual_rad;
+    pub_msg.pose.covariance[8] = steer_front_setpoint_bit;
+    pub_msg.pose.covariance[9] = steer_front_setpoint_rad;
+    pub_msg.pose.covariance[10] = steer_rear_actual_bit;
+    pub_msg.pose.covariance[11] = steer_rear_actual_rad;
+    pub_msg.pose.covariance[12] = handbrake_setpoint_now;
+    pub_msg.pose.covariance[13] = locker_setpoint;
+    pub_msg.pose.covariance[14] = brake_current;
+    pub_msg.pose.covariance[15] = steer_routine_mode;
+    pub_msg.pose.covariance[16] = brake_regen_setpoint;
+    
+    pub.publish( &pub_msg);
+  }
+  nh.spinOnce();
+}
+/*--------------------------------------------------------------------*/

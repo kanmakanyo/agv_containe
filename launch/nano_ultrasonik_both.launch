@@ -1,0 +1,11 @@
+<launch>
+  <node name="serial_node_nano_us_front" pkg="rosserial_python" type="serial_node.py" output="screen">
+    <param name="port" type="string" value="/dev/serial/by-path/pci-0000:00:14.0-usb-0:3.1.4.4:1.0-port0"/>
+    <param name="baud" type="int" value="500000"/>
+  </node>
+
+  <node name="serial_node_nano_us_rear" pkg="rosserial_python" type="serial_node.py" output="screen">
+    <param name="port" type="string" value="/dev/serial/by-path/pci-0000:00:14.0-usb-0:3.1.4.3:1.0-port0"/>
+    <param name="baud" type="int" value="500000"/>
+  </node>
+</launch>

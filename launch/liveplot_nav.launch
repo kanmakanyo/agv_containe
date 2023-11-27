@@ -1,0 +1,6 @@
+<launch>
+  <arg name="control_config_file" default="$(find agv_container)/config/params_control.yaml"/>
+  <node pkg="agv_container" type="liveplot_nav.py" name="liveplot_nav_node" output="screen">
+    <rosparam file="$(arg control_config_file)" command="load"/>
+  </node>
+</launch>

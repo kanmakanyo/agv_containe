@@ -1,0 +1,11 @@
+daftar /dev/serial/by-path/
+---------------------------
+(mega)                      usb mini pc belakang bawah:        pci-0000:00:14.0-usb-0:3:1.0-port0
+(nano tacho)                usb hub ke-5, usb hub ke :                    
+(imu)                                                           
+(lidar)                                                         pci-0000:00:14.0-usb-0:2:1.0-port0
+(gnss front)                                                    pci-0000:00:14.0-usb-0:4.2:1.2
+(gnss rear)                                                     pci-0000:00:14.0-usb-0:4.1.4.1:1.2
+(nano ultrasonik front)                                         pci-0000:00:14.0-usb-0:3.3:1.0-port0
+(nano ultrasonik rear)
+(kamera)                                                       

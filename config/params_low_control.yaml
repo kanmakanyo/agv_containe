@@ -1,0 +1,5 @@
+#### Encoder Bit Value When Steer 0 Degree ####
+enc_center: 84 
+
+#### Pass Band for On Off Steering Controller ####
+steer_pass_band: 0.5 

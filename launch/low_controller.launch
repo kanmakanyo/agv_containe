@@ -1,0 +1,6 @@
+<launch>
+  <arg name="control_config_file" default="$(find agv_container)/config/params_low_control.yaml"/>
+  <node pkg="agv_container" type="low_level_controller.py" name="low_level_control_node" output="screen">
+     <rosparam file="$(arg control_config_file)" command="load"/>
+  </node>
+</launch>
